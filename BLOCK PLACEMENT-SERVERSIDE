@@ -1,0 +1,107 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent")
+local CheckBlockEvent = ReplicatedStorage:WaitForChild("CheckBlockEvent")
+local BlockTemplate = ReplicatedStorage:WaitForChild("BlockTemplate")
+
+local BlocksFolder = workspace:FindFirstChild("PlacedBlocks")
+if not BlocksFolder then
+	BlocksFolder = Instance.new("Folder")
+	BlocksFolder.Name = "PlacedBlocks"
+	BlocksFolder.Parent = workspace
+end
+
+local gridSize = 4
+local placedBlocks = {}
+
+local function toGridCoord(position)
+	return {
+		X = math.floor(position.X / gridSize + 0.5),
+		Y = math.floor(position.Y / gridSize + 0.5),
+		Z = math.floor(position.Z / gridSize + 0.5),
+	}
+end
+
+local function posKeyFromGrid(gridPos)
+	return string.format("%d_%d_%d", gridPos.X, gridPos.Y, gridPos.Z)
+end
+
+local function blockExistsAtGrid(gridPos)
+	return placedBlocks[posKeyFromGrid(gridPos)] ~= nil
+end
+
+local function hasAdjacentBlock(position)
+	local gridPos = toGridCoord(position)
+	print("[hasAdjacentBlock] Checking position", gridPos.X, gridPos.Y, gridPos.Z)
+
+	local directions = {
+		{1,0,0},{-1,0,0},
+		{0,1,0},{0,-1,0},
+		{0,0,1},{0,0,-1},
+	}
+
+	if gridPos.Y <= 0 then
+		print("[hasAdjacentBlock] At ground or below, allowing placement")
+		return true
+	end
+
+	for _, dir in ipairs(directions) do
+		local neighbor = {
+			X = gridPos.X + dir[1],
+			Y = gridPos.Y + dir[2],
+			Z = gridPos.Z + dir[3],
+		}
+		if blockExistsAtGrid(neighbor) then
+			print("[hasAdjacentBlock] Adjacent block found at", neighbor.X, neighbor.Y, neighbor.Z)
+			return true
+		end
+	end
+	print("[hasAdjacentBlock] No adjacent blocks found")
+	return false
+end
+
+PlaceBlockEvent.OnServerEvent:Connect(function(player, action, position, rotation)
+	if not player or not action or not position then return end
+
+	local gridPos = toGridCoord(position)
+	local key = posKeyFromGrid(gridPos)
+	local worldPos = Vector3.new(gridPos.X * gridSize, gridPos.Y * gridSize, gridPos.Z * gridSize)
+
+	print("[PlaceBlockEvent] Received:", player.Name, action, position, rotation)
+	print("[PlaceBlockEvent] Grid position:", key)
+
+	if action == "Place" then
+		if placedBlocks[key] then
+			print("[PlaceBlockEvent] Block already exists at:", key)
+			return
+		end
+		if not hasAdjacentBlock(position) then
+			print("[PlaceBlockEvent] No adjacent block, cannot place at:", key)
+			return
+		end
+
+		print("[PlaceBlockEvent] Placing block at:", worldPos)
+
+		local block = BlockTemplate:Clone()
+		block.CFrame = CFrame.new(worldPos + Vector3.new(0, gridSize/2, 0)) * CFrame.Angles(0, math.rad(rotation or 0), 0)
+		block.Anchored = true
+		block.CanCollide = true
+		block.Parent = BlocksFolder
+
+		placedBlocks[key] = block
+
+	elseif action == "Delete" then
+		local block = placedBlocks[key]
+		if block then
+			block:Destroy()
+			placedBlocks[key] = nil
+		end
+	end
+end)
+
+CheckBlockEvent.OnServerInvoke = function(player, position)
+	local gridPos = toGridCoord(position)
+	local exists = blockExistsAtGrid(gridPos)
+	print(string.format("[CheckBlockEvent] Invoked by %s at %d_%d_%d Exists: %s", player.Name, gridPos.X, gridPos.Y, gridPos.Z, tostring(exists)))
+	return exists
+end
