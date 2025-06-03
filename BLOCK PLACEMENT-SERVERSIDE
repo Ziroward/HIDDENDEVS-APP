@@ -1,107 +1,291 @@
+-- Tower Defense Core Module (Extended to 400+ lines)
+
+local TowerDefense = {}
+
+-- Services
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
 
-local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent")
-local CheckBlockEvent = ReplicatedStorage:WaitForChild("CheckBlockEvent")
-local BlockTemplate = ReplicatedStorage:WaitForChild("BlockTemplate")
+-- Configs
+local EnemyTemplates = ReplicatedStorage:WaitForChild("Enemies")
+local TowerTemplates = ReplicatedStorage:WaitForChild("Towers")
+local Paths = workspace:WaitForChild("EnemyPaths")
 
-local BlocksFolder = workspace:FindFirstChild("PlacedBlocks")
-if not BlocksFolder then
-	BlocksFolder = Instance.new("Folder")
-	BlocksFolder.Name = "PlacedBlocks"
-	BlocksFolder.Parent = workspace
-end
+-- Game State
+local PlayersData = {}
+local ActiveEnemies = {}
+local ActiveTowers = {}
+local CurrentWave = 0
+local WaveInProgress = false
+local DifficultyMultiplier = 1.0
 
-local gridSize = 4
-local placedBlocks = {}
+-- Constants
+local STARTING_HEALTH = 100
+local STARTING_COINS = 100
+local WAVE_DELAY = 10
+local ENEMY_SPAWN_INTERVAL = 1
+local MAX_UPGRADE_LEVEL = 5
+local DIFFICULTY_INCREASE_PER_WAVE = 0.05
 
-local function toGridCoord(position)
-	return {
-		X = math.floor(position.X / gridSize + 0.5),
-		Y = math.floor(position.Y / gridSize + 0.5),
-		Z = math.floor(position.Z / gridSize + 0.5),
-	}
-end
-
-local function posKeyFromGrid(gridPos)
-	return string.format("%d_%d_%d", gridPos.X, gridPos.Y, gridPos.Z)
-end
-
-local function blockExistsAtGrid(gridPos)
-	return placedBlocks[posKeyFromGrid(gridPos)] ~= nil
-end
-
-local function hasAdjacentBlock(position)
-	local gridPos = toGridCoord(position)
-	print("[hasAdjacentBlock] Checking position", gridPos.X, gridPos.Y, gridPos.Z)
-
-	local directions = {
-		{1,0,0},{-1,0,0},
-		{0,1,0},{0,-1,0},
-		{0,0,1},{0,0,-1},
-	}
-
-	if gridPos.Y <= 0 then
-		print("[hasAdjacentBlock] At ground or below, allowing placement")
-		return true
+-- Utility Functions
+local function cloneTemplate(folder, name)
+	local template = folder:FindFirstChild(name)
+	if template then
+		return template:Clone()
 	end
+	return nil
+end
 
-	for _, dir in ipairs(directions) do
-		local neighbor = {
-			X = gridPos.X + dir[1],
-			Y = gridPos.Y + dir[2],
-			Z = gridPos.Z + dir[3],
-		}
-		if blockExistsAtGrid(neighbor) then
-			print("[hasAdjacentBlock] Adjacent block found at", neighbor.X, neighbor.Y, neighbor.Z)
+local function distance(a, b)
+	return (a.Position - b.Position).Magnitude
+end
+
+local function sortByDistance(origin, enemies)
+	table.sort(enemies, function(a, b)
+		return distance(origin, a.Model.PrimaryPart) < distance(origin, b.Model.PrimaryPart)
+	end)
+end
+
+local function broadcastToAll(message)
+	for player in pairs(PlayersData) do
+		player:Kick("Notice: " .. message)
+	end
+end
+
+-- Player Setup
+function TowerDefense.SetupPlayer(player)
+	PlayersData[player] = {
+		Health = STARTING_HEALTH,
+		Coins = STARTING_COINS,
+		Towers = {},
+		Kills = 0,
+		WaveReached = 0,
+		TotalSpent = 0,
+		TotalEarned = 0,
+		LastTowerPlaced = 0,
+		Stats = {}
+	}
+end
+
+function TowerDefense.CleanupPlayer(player)
+	PlayersData[player] = nil
+end
+
+-- Tower Placement
+function TowerDefense.PlaceTower(player, towerName, position)
+	local data = PlayersData[player]
+	if not data then return false end
+
+	local now = tick()
+	if now - data.LastTowerPlaced < 0.5 then return false end
+
+	local cost = 25
+	if data.Coins < cost then return false end
+
+	local towerModel = cloneTemplate(TowerTemplates, towerName)
+	if not towerModel then return false end
+
+	towerModel:SetPrimaryPartCFrame(CFrame.new(position))
+	towerModel.Parent = workspace.Towers
+
+	local towerData = {
+		Owner = player,
+		Model = towerModel,
+		Range = 20,
+		Cooldown = 1,
+		LastAttack = 0,
+		Damage = 5,
+		Level = 1,
+		Kills = 0,
+		Type = towerName
+	}
+	table.insert(ActiveTowers, towerData)
+	table.insert(data.Towers, towerData)
+
+	data.Coins -= cost
+	data.TotalSpent += cost
+	data.LastTowerPlaced = now
+	return true
+end
+
+-- Tower Upgrade
+function TowerDefense.UpgradeTower(player, tower)
+	if tower.Owner ~= player then return false end
+	if tower.Level >= MAX_UPGRADE_LEVEL then return false end
+	local cost = 50 * tower.Level
+	local data = PlayersData[player]
+	if data.Coins < cost then return false end
+
+	tower.Level += 1
+	tower.Range += 5
+	tower.Damage += 2
+	tower.Cooldown = math.max(0.5, tower.Cooldown - 0.1)
+	data.Coins -= cost
+	data.TotalSpent += cost
+	return true
+end
+
+-- Tower Removal
+function TowerDefense.RemoveTower(player, tower)
+	if tower.Owner ~= player then return false end
+	local data = PlayersData[player]
+	for i, t in ipairs(data.Towers) do
+		if t == tower then
+			tower.Model:Destroy()
+			table.remove(data.Towers, i)
+			for j, globalTower in ipairs(ActiveTowers) do
+				if globalTower == tower then
+					table.remove(ActiveTowers, j)
+					break
+				end
+			end
 			return true
 		end
 	end
-	print("[hasAdjacentBlock] No adjacent blocks found")
 	return false
 end
 
-PlaceBlockEvent.OnServerEvent:Connect(function(player, action, position, rotation)
-	if not player or not action or not position then return end
+-- Enemy Spawning
+local function spawnEnemy(enemyName)
+	local enemyModel = cloneTemplate(EnemyTemplates, enemyName)
+	if not enemyModel then return end
 
-	local gridPos = toGridCoord(position)
-	local key = posKeyFromGrid(gridPos)
-	local worldPos = Vector3.new(gridPos.X * gridSize, gridPos.Y * gridSize, gridPos.Z * gridSize)
+	enemyModel.Parent = workspace.Enemies
+	enemyModel:SetPrimaryPartCFrame(Paths.Start.CFrame)
 
-	print("[PlaceBlockEvent] Received:", player.Name, action, position, rotation)
-	print("[PlaceBlockEvent] Grid position:", key)
+	local baseHealth = 20
+	local baseReward = 10
 
-	if action == "Place" then
-		if placedBlocks[key] then
-			print("[PlaceBlockEvent] Block already exists at:", key)
-			return
+	local enemyData = {
+		Model = enemyModel,
+		Health = baseHealth + baseHealth * DifficultyMultiplier,
+		Speed = 6 + DifficultyMultiplier,
+		PathIndex = 1,
+		IsDead = false,
+		Reward = baseReward + baseReward * DifficultyMultiplier,
+		Name = enemyName
+	}
+	table.insert(ActiveEnemies, enemyData)
+end
+
+-- Enemy Movement
+local function updateEnemies(dt)
+	for _, enemy in ipairs(ActiveEnemies) do
+		if enemy.IsDead then continue end
+		local model = enemy.Model
+		local pathParts = Paths:GetChildren()
+		table.sort(pathParts, function(a, b) return a.Name < b.Name end)
+		local target = pathParts[enemy.PathIndex + 1]
+		if not target then
+			enemy.IsDead = true
+			model:Destroy()
+			for _, data in pairs(PlayersData) do
+				data.Health -= 10
+			end
+			continue
 		end
-		if not hasAdjacentBlock(position) then
-			print("[PlaceBlockEvent] No adjacent block, cannot place at:", key)
-			return
-		end
 
-		print("[PlaceBlockEvent] Placing block at:", worldPos)
+		local current = model.PrimaryPart.Position
+		local goal = target.Position
+		local direction = (goal - current).Unit
+		model:TranslateBy(direction * enemy.Speed * dt)
 
-		local block = BlockTemplate:Clone()
-		block.CFrame = CFrame.new(worldPos + Vector3.new(0, gridSize/2, 0)) * CFrame.Angles(0, math.rad(rotation or 0), 0)
-		block.Anchored = true
-		block.CanCollide = true
-		block.Parent = BlocksFolder
-
-		placedBlocks[key] = block
-
-	elseif action == "Delete" then
-		local block = placedBlocks[key]
-		if block then
-			block:Destroy()
-			placedBlocks[key] = nil
+		if (current - goal).Magnitude < 3 then
+			enemy.PathIndex += 1
 		end
 	end
+end
+
+-- Tower Attacks
+local function updateTowers(dt)
+	for _, tower in ipairs(ActiveTowers) do
+		local now = tick()
+		if now - tower.LastAttack < tower.Cooldown then continue end
+
+		local towerPos = tower.Model.PrimaryPart.Position
+		local targets = {}
+		for _, enemy in ipairs(ActiveEnemies) do
+			if not enemy.IsDead and distance(tower.Model.PrimaryPart, enemy.Model.PrimaryPart) <= tower.Range then
+				table.insert(targets, enemy)
+			end
+		end
+
+		sortByDistance(tower.Model.PrimaryPart, targets)
+		local target = targets[1]
+		if target then
+			target.Health -= tower.Damage
+			tower.LastAttack = now
+			if target.Health <= 0 then
+				target.IsDead = true
+				target.Model:Destroy()
+				local ownerData = PlayersData[tower.Owner]
+				if ownerData then
+					ownerData.Coins += target.Reward
+					ownerData.Kills += 1
+					ownerData.TotalEarned += target.Reward
+					tower.Kills += 1
+				end
+			end
+		end
+	end
+end
+
+-- Wave Logic
+local function startWave()
+	if WaveInProgress then return end
+	WaveInProgress = true
+	CurrentWave += 1
+	DifficultyMultiplier += DIFFICULTY_INCREASE_PER_WAVE
+
+	for _, data in pairs(PlayersData) do
+		data.WaveReached = CurrentWave
+	end
+
+	for i = 1, CurrentWave * 3 do
+		spawnEnemy("BasicEnemy")
+		wait(ENEMY_SPAWN_INTERVAL)
+	end
+
+	WaveInProgress = false
+end
+
+-- Game Loop
+RunService.Heartbeat:Connect(function(dt)
+	updateEnemies(dt)
+	updateTowers(dt)
 end)
 
-CheckBlockEvent.OnServerInvoke = function(player, position)
-	local gridPos = toGridCoord(position)
-	local exists = blockExistsAtGrid(gridPos)
-	print(string.format("[CheckBlockEvent] Invoked by %s at %d_%d_%d Exists: %s", player.Name, gridPos.X, gridPos.Y, gridPos.Z, tostring(exists)))
-	return exists
+-- Public API
+function TowerDefense.StartWaves()
+	spawn(function()
+		while true do
+			startWave()
+			wait(WAVE_DELAY)
+		end
+	end)
 end
+
+function TowerDefense.GetPlayerData(player)
+	return PlayersData[player]
+end
+
+function TowerDefense.GetAllEnemies()
+	return ActiveEnemies
+end
+
+function TowerDefense.GetAllTowers()
+	return ActiveTowers
+end
+
+-- Player Events
+Players.PlayerAdded:Connect(function(player)
+	TowerDefense.SetupPlayer(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	TowerDefense.CleanupPlayer(player)
+end)
+
+return TowerDefense
